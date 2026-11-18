@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""Run one fixed family of agents (lois, stewie, brian, peter, meg) in herdr:
+
+    lois   | stewie
+    -------+-------
+    brian  | peter
+           |-------
+           | meg
+
+meg is the odd one out: she runs on GitHub Copilot (the copilot CLI), not
+Claude, and only reviews code. Her persona and the family note go into a
+Copilot custom agent, ~/.copilot/agents/griffins-meg.agent.md (COPILOT_HOME
+overrides ~/.copilot), written each time she starts.
+
+The family is set up in one place, ~/family (GRIFFINS_HOME overrides it):
+agents/<name>.md (personality, command, status line, spinner), family.md (the
+family note and role sections), settings.json (Claude settings shared by all
+agents). The agents themselves run in the repo(s) being worked on, so each
+repo's CLAUDE.md, memory and .claude settings load natively.
+
+Two windows run the same family: the Windows herdr app (herdr-app.exe, panes
+start on Windows and run the agent back in WSL) or the WSL herdr TUI.
+
+Usage: griffins [--ui app|tui] [folder...]
+                                  start the family (default folder: ~/family);
+                                  if it is already running, focus it
+       griffins move <folder> [folder...]
+                                  restart each idle or done agent in <folder>
+                                  (extra folders are added with --add-dir)
+       griffins send <name> <message>
+       griffins status            each agent's state
+       griffins clear <name>      clear an idle or done agent's screen
+       griffins --agent <name> [app|tui] [--resume <session-id>]
+                                  used by the panes: the agent's restart loop;
+                                  --resume brings back a Claude conversation
+                                  (its first run only), keeping the agent's setup
+       griffins statusline <name> Claude's status line
+       griffins report-session    Claude's SessionStart hook: tells herdr to
+                                  restore this agent with griffins --resume
+       griffins --help
+
+Environment: GRIFFINS_FAMILY (family name, default griffins), GRIFFINS_HOME,
+GRIFFINS_HERDR_APP and GRIFFINS_HC (the Windows app's herdr-app.exe and hc.exe;
+found under C:\\Users\\*\\AppData\\Local\\Programs by default),
+GRIFFINS_UI (app|tui: which window send/status/clear/move talk to; default
+whichever one runs the family), GRIFFINS_HERDR_SESSION (herdr session for the
+TUI, default the default session), GRIFFINS_AGENT (who sends: set in the panes).
+"""
+import glob
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+
+AGENTS = ["lois", "stewie", "brian", "peter", "meg"]
+
+
+def windows_program(*parts):
+    """A program installed under the Windows user's AppData/Local/Programs, found from WSL."""
+    found = sorted(glob.glob(os.path.join("/mnt/c/Users/*/AppData/Local/Programs", *parts)))
+    return found[0] if found else os.path.join("/mnt/c/Users/<user>/AppData/Local/Programs", *parts)
+
+
+# The Windows herdr app; GRIFFINS_HERDR_APP and GRIFFINS_HC override where they are.
+HERDR_APP = os.environ.get("GRIFFINS_HERDR_APP") or windows_program("herdr-app", "herdr-app.exe")
+HC = os.environ.get("GRIFFINS_HC") or windows_program("herdr-core", "hc.exe")
+SELF = os.path.abspath(__file__)
+SEP = " · "
+# Env passed on to the panes, so a family started with them keeps them.
+PASS_ENV = ["GRIFFINS_FAMILY", "GRIFFINS_HOME", "GRIFFINS_HERDR_SESSION"]
+
+
+class Fail(Exception):
+    """An expected failure: printed as 'griffins: <message>' without a traceback."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
+
+
+def home():
+    return os.path.abspath(os.path.expanduser(os.environ.get("GRIFFINS_HOME") or "~/family"))
+
+
+def family():
+    return os.environ.get("GRIFFINS_FAMILY") or "griffins"
+
+
+def display_name():
+    name = family()
+    return name[:1].upper() + name[1:]
+
+
+def space_name(folders):
+    """'<first folder basename>', just 'Griffins' in the family home."""
+    first = os.path.abspath(folders[0]) if folders else home()
+    if first == home():
+        return display_name()
+    return os.path.basename(first)
+
+
+# --- the family on disk ---------------------------------------------------------
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError as e:
+        raise Fail(f"cannot read {path}: {e.strerror}")
+
+
+def load_agent(name):
+    """agents/<name>.md: its frontmatter keys (command, emoji, status, spinner) and body."""
+    text = read_file(os.path.join(home(), "agents", f"{name}.md"))
+    m = re.match(r"^---\n(.*?)\n---\n(.*)$", text, re.S)
+    if not m:
+        raise Fail(f"{name}.md has no frontmatter")
+    front = {}
+    for line in m.group(1).splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            front[key.strip()] = value.strip()
+    if not front.get("command"):
+        raise Fail(f"{name}.md has no command")
+    # The body ends with "Your task:" for hc run; here the person types it.
+    body = re.sub(r"\n*Your task:\s*$", "", m.group(2).strip())
+    return front, body
+
+
+def family_note(name):
+    """family.md: the shared note with the agent's role section in place of {role}."""
+    parts = re.split(r"^## (\w+)[ \t]*$", read_file(os.path.join(home(), "family.md")), flags=re.M)
+    roles = {parts[i]: parts[i + 1].strip() for i in range(1, len(parts) - 1, 2)}
+    role = roles.get(name) or roles.get("others", "")
+    return "\n" + parts[0].strip().replace("{name}", name).replace("{role}", "\n" + role)
+
+
+def settings(name):
+    """settings.json shared by all agents plus this agent's status line and spinner verbs."""
+    try:
+        merged = json.loads(read_file(os.path.join(home(), "settings.json")) or "{}")
+    except json.JSONDecodeError as e:
+        raise Fail(f"settings.json: {e}")
+    front, _ = load_agent(name)
+    merged["statusLine"] = {"type": "command", "command": f"{shlex.quote(SELF)} statusline {name}"}
+    merged["spinnerVerbs"] = {"mode": "replace", "verbs": [v.strip() for v in front.get("spinner", "").split("|") if v.strip()]}
+    # After a herdr restart, come back through griffins (persona, loop) rather than a bare claude --resume.
+    merged.setdefault("hooks", {}).setdefault("SessionStart", []).append(
+        {"hooks": [{"type": "command", "command": f"{shlex.quote(SELF)} report-session", "timeout": 10}]})
+    return json.dumps(merged)
+
+
+def is_copilot(command):
+    return os.path.basename(command[0]) == "copilot"
+
+
+def copilot_agent(name, body):
+    """Write the Copilot custom agent that carries a copilot agent's persona; returns its name."""
+    front, _ = load_agent(name)
+    agent = f"{family()}-{name}"
+    folder = os.path.join(os.path.expanduser(os.environ.get("COPILOT_HOME") or "~/.copilot"), "agents")
+    os.makedirs(folder, exist_ok=True)
+    description = front.get("description", name).replace('"', "'")
+    text = f'---\nname: {agent}\ndescription: "{description}"\n---\n\n{body}\n{family_note(name)}\n'
+    path = os.path.join(folder, f"{agent}.agent.md")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+    return agent
+
+
+def agent_argv(name, extra_dirs):
+    """The agent's command plus its name, settings, extra folders and system prompt."""
+    front, body = load_agent(name)
+    command = shlex.split(front["command"])
+    if is_copilot(command):
+        # Copilot has no --settings or --append-system-prompt: the persona is a custom agent.
+        dirs = [a for d in extra_dirs for a in ("--add-dir", d)]
+        return command + ["--agent", copilot_agent(name, body), *dirs]
+    # --add-dir takes a list, so the next flag ends it.
+    head = ["--name", name.capitalize(), "--settings", settings(name)]
+    if extra_dirs:
+        head += ["--add-dir", *extra_dirs]
+    return command[:1] + head + command[1:] + ["--append-system-prompt", body + "\n" + family_note(name)]
+
+
+def statusline(name):
+    """Claude's status line: reads its JSON on stdin, prints one line."""
+    try:
+        info = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        info = {}
+    if not isinstance(info, dict):
+        info = {}
+    front, _ = load_agent(name)
+    workspace = info.get("workspace") if isinstance(info.get("workspace"), dict) else {}
+    folder = workspace.get("project_dir") or workspace.get("current_dir") or info.get("cwd")
+    model = info.get("model") if isinstance(info.get("model"), dict) else {}
+    parts = [f"{front.get('emoji', '')} {name.capitalize()}".strip(), front.get("status")]
+    parts.append(os.path.basename(str(folder).rstrip("/\\")) if folder else None)
+    parts.append(model.get("display_name"))
+    print(SEP.join(p for p in parts if p))
+
+
+def report_session():
+    """SessionStart hook: report 'griffins --agent <name> tui --resume <id>' as the pane's
+    resume command, so herdr restores the agent with its setup, at the same conversation."""
+    try:
+        session = json.load(sys.stdin).get("session_id")
+    except (json.JSONDecodeError, AttributeError):
+        return
+    name, pane = os.environ.get("GRIFFINS_AGENT"), os.environ.get("HERDR_PANE_ID")
+    # Only the TUI's panes are herdr panes; the Windows app restores its own way.
+    if not (session and name in AGENTS and pane and os.environ.get("GRIFFINS_UI") == "tui"):
+        return
+    herdr = os.environ.get("HERDR_BIN_PATH") or "herdr"
+    hs = os.environ.get("GRIFFINS_HERDR_SESSION")
+    subprocess.run([herdr, *(["--session", hs] if hs else []), "pane", "report-agent-session", pane,
+                    "--source", "griffins", "--agent", "claude", "--agent-session-id", session,
+                    "--", "griffins", "--agent", name, "tui", "--resume", session],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+# --- runtime state --------------------------------------------------------------
+
+def state_path(name, ext="json"):
+    """state/<family>/<name>.<ext>: each family keeps its own, so several can run (e.g. one per repo)."""
+    return os.path.join(home(), "state", family(), f"{name}.{ext}")
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def read_folders(name):
+    try:
+        with open(state_path(name)) as f:
+            folders = json.load(f)["folders"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return folders if isinstance(folders, list) and all(isinstance(x, str) for x in folders) else None
+
+
+def write_folders(name, folders):
+    write_json(state_path(name), {"folders": folders})
+
+
+def touch_restart(name):
+    with open(state_path(name, "restart"), "w"):
+        pass
+
+
+# --- the restart loop -----------------------------------------------------------
+
+def agent_loop(name, ui, resume=None):
+    """Run claude as a child in the agent's folder; run it again after a move."""
+    os.environ["GRIFFINS_AGENT"] = name
+    os.environ["GRIFFINS_FAMILY"] = family()
+    os.environ["GRIFFINS_UI"] = ui
+    started_in = os.getcwd()
+    # A no-op handler, not SIG_IGN: the child resets a handler on exec but would
+    # inherit an ignore, and a stray Ctrl+C must not kill the loop (and, via
+    # subprocess's kill-on-exception, the agent).
+    signal.signal(signal.SIGINT, lambda *_: None)
+    while True:
+        folders = [f for f in (read_folders(name) or []) if os.path.isdir(f)]
+        # The first folder gone: where this agent started, else the family home.
+        if not folders or folders[0] != (read_folders(name) or [None])[0]:
+            folders = [started_in if os.path.isdir(started_in) else home()]
+        os.chdir(folders[0])
+        try:
+            argv = agent_argv(name, folders[1:])
+        except Fail as e:
+            sys.exit(f"griffins: {e}")
+        if resume:
+            argv, resume = argv + ["--resume", resume], None
+        code = subprocess.run(argv).returncode
+        if os.path.exists(state_path(name, "restart")):
+            os.unlink(state_path(name, "restart"))
+            continue
+        sys.exit(code)
+
+
+# --- backends -------------------------------------------------------------------
+
+def run_json(argv, what):
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True)
+    except OSError as e:
+        raise Fail(f"{what}: {e.strerror or e}")
+    if out.returncode == 0 and not out.stdout.strip():
+        return {}  # e.g. herdr pane run prints nothing
+    # herdr prints its errors as JSON on stderr, with nothing on stdout
+    text = out.stdout if out.stdout.strip() else out.stderr
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        raise Fail(f"{what}: {out.stdout or out.stderr}".strip())
+    if isinstance(result, dict) and "error" in result:
+        err = result["error"]
+        if isinstance(err, dict):
+            raise Fail(f"{what}: {err.get('message') or err}", err.get("code"))
+        raise Fail(f"{what}: {err}")
+    return result
+
+
+def is_idle(state):
+    return state in ("idle", "done")
+
+
+class App:
+    """The Windows herdr app: herdr-app.exe do and hc.exe; the family is found by hc labels."""
+    ui = "app"
+
+    def do(self, command, **args):
+        return run_json([HERDR_APP, "do", command, json.dumps(args)], command)
+
+    def terminals(self, name=None):
+        labels = ["--label", f"griffins-family={family()}"]
+        if name:
+            labels += ["--label", f"griffins={name}"]
+        found = run_json([HC, "ls", "--json", *labels], "ls")
+        return found.get("terminals", found) if isinstance(found, dict) else found
+
+    def agents(self):
+        """name -> the newest live terminal of that agent."""
+        newest = {}
+        for t in self.terminals():
+            got = run_json([HC, "get", "--json", t["address"]], "get")
+            got = got.get("terminal", got)
+            name = (got.get("labels") or {}).get("griffins")
+            if name in AGENTS and (name not in newest or (got.get("created_ms") or 0) > (newest[name].get("created_ms") or 0)):
+                newest[name] = got
+        status = lambda t: t.get("status") or {}
+        return {n: {"id": t["address"], "state": status(t).get("state"), "msg": status(t).get("msg") or "",
+                    "loop": (t.get("argv") or [""])[-1].rstrip().endswith(" app"),
+                    "space": (t.get("labels") or {}).get("herdr.space")}
+                for n, t in newest.items()}
+
+    def running(self):
+        return bool(self.agents())
+
+    def where(self):
+        return "the Windows herdr app"
+
+    def send(self, info, text):
+        run_json([HC, "send", "--json", info["id"], text], "send")
+
+    def type_command(self, info, text):
+        run_json([HC, "keys", "--json", info["id"], *text], "keys")
+        run_json([HC, "keys", "--json", info["id"], "enter"], "keys")
+
+    def focus(self, agents):
+        info = agents.get("lois") or next(iter(agents.values()))
+        self.do("pane.focus", terminal=info["id"])
+
+    def rename(self, agents, folders):
+        spaces = {a["space"] for a in agents.values() if a.get("space")}
+        if len(spaces) == 1:
+            self.do("space.rename", id=spaces.pop(), name=space_name(folders))
+
+    def start(self, folders):
+        folder = folders[0]
+        lois = self.do("space.new", name=space_name(folders), tab="Family Guy", argv=self.pane_argv("lois", folder))
+        stewie = self.do("pane.split", direction="right", argv=self.pane_argv("stewie", folder))
+        peter = self.do("pane.split", direction="down", pane=stewie["pane"], argv=self.pane_argv("peter", folder))
+        meg = self.do("pane.split", direction="down", pane=peter["pane"], argv=self.pane_argv("meg", folder))
+        self.do("pane.focus", terminal=lois["terminal"])
+        brian = self.do("pane.split", direction="down", argv=self.pane_argv("brian", folder))
+        self.do("pane.focus", terminal=stewie["terminal"])
+        for name, made in [("stewie", stewie), ("brian", brian), ("lois", lois), ("peter", peter), ("meg", meg)]:
+            run_json([HC, "label", "--json", made["terminal"], f"griffins={name}",
+                      f"griffins-family={family()}"], "label")
+
+    def pane_argv(self, name, folder):
+        """Start the agent in WSL; a login shell so nvm puts claude on PATH."""
+        env = [f"{k}={os.environ[k]}" for k in PASS_ENV if k in os.environ and k != "GRIFFINS_HERDR_SESSION"]
+        prefix = "env " + " ".join(shlex.quote(e) for e in env) + " " if env else ""
+        return ["wsl.exe", "--cd", folder, "--", "bash", "-lic",
+                f"exec {prefix}{shlex.quote(SELF)} --agent {name} app"]
+
+
+class Tui:
+    """The WSL herdr TUI: the herdr CLI; the family is the workspace labelled with its name."""
+    ui = "tui"
+
+    def cli(self, *args):
+        session = os.environ.get("GRIFFINS_HERDR_SESSION")
+        argv = ["herdr", *(["--session", session] if session else []), *args]
+        return run_json(argv, "herdr " + " ".join(args[:2])).get("result", {})
+
+    def session(self):
+        return os.environ.get("GRIFFINS_HERDR_SESSION") or ""
+
+    def saved_id(self):
+        """The workspace start made, if it was made in this herdr session."""
+        try:
+            with open(state_path("tui")) as f:
+                saved = json.load(f)
+            return saved["workspace_id"] if saved.get("session", "") == self.session() else None
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return None
+
+    def workspace(self):
+        """The family's workspace: the one start made (renaming it in herdr is fine),
+        else one labelled 'Griffins' or 'Griffins · <repo>'."""
+        workspaces = self.cli("workspace", "list").get("workspaces", [])
+        saved = self.saved_id()
+        for w in workspaces:
+            if saved and w.get("workspace_id") == saved:
+                return w
+        name = display_name()
+        for w in workspaces:
+            label = w.get("label") or ""
+            if label == name or label.startswith(name + SEP):
+                return w
+        return None
+
+    def agents(self):
+        w = self.workspace()
+        if not w:
+            return {}
+        found = {}
+        for p in self.cli("pane", "list", "--workspace", w["workspace_id"]).get("panes", []):
+            # A pane without an agent (the shell after /exit) has no "agent" field.
+            if p.get("label") in AGENTS and p.get("agent"):
+                found[p["label"]] = {"id": p["pane_id"], "state": p.get("agent_status"), "msg": "", "loop": True}
+        return found
+
+    def running(self):
+        return bool(self.agents())
+
+    def where(self):
+        w = self.workspace()
+        session = os.environ.get("GRIFFINS_HERDR_SESSION")
+        return f"the herdr TUI workspace \"{w['label']}\"" + (f" (session {session})" if session else "")
+
+    def send(self, info, text):
+        try:
+            self.cli("agent", "prompt", info["id"], text)
+        except Fail as e:
+            if e.code == "agent_blocked":
+                raise Fail(f"{info['id']} is waiting on the person (blocked); try again once they answered")
+            raise
+
+    def type_command(self, info, text):
+        self.cli("pane", "send-text", info["id"], text)
+        self.cli("pane", "send-keys", info["id"], "enter")
+
+    def focus(self, agents):
+        self.cli("workspace", "focus", self.workspace()["workspace_id"])
+        session = os.environ.get("GRIFFINS_HERDR_SESSION")
+        print("if the herdr TUI isn't open, open it with: herdr" + (f" --session {session}" if session else ""))
+
+    def rename(self, agents, folders):
+        w = self.workspace()
+        if w:
+            self.cli("workspace", "rename", w["workspace_id"], space_name(folders))
+
+    def start(self, folders):
+        folder = folders[0]
+        env = [a for k in PASS_ENV if k in os.environ for a in ("--env", f"{k}={os.environ[k]}")]
+        made = self.cli("workspace", "create", "--cwd", folder, "--label", space_name(folders), "--focus", *env)
+        write_json(state_path("tui"), {"workspace_id": made["workspace"]["workspace_id"], "session": self.session()})
+        panes = {"lois": made["root_pane"]["pane_id"]}
+
+        def split(of, direction):
+            return self.cli("pane", "split", "--pane", panes[of], "--direction", direction,
+                            "--cwd", folder, "--no-focus", *env)["pane"]["pane_id"]
+
+        panes["stewie"] = split("lois", "right")
+        panes["peter"] = split("stewie", "down")
+        panes["brian"] = split("lois", "down")
+        panes["meg"] = split("peter", "down")
+        for name in AGENTS:
+            self.cli("pane", "rename", panes[name], name)
+        for name in AGENTS:
+            # No exec: the pane keeps its shell after the loop ends.
+            self.cli("pane", "run", panes[name], f"{shlex.quote(SELF)} --agent {name} tui")
+        # Sidebar colours and icons: tokens last only as long as the pane, so tag the new ones.
+        tagger = os.path.expanduser("~/.config/herdr/tag-spaces.sh")
+        if os.path.exists(tagger):
+            subprocess.run([tagger], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+BACKENDS = {"app": App, "tui": Tui}
+
+
+def probe(backend):
+    """The backend's agents, or {} when it errors or isn't reachable."""
+    try:
+        return backend.agents()
+    except Fail:
+        return {}
+
+
+def find_family():
+    """(backend, agents) of the window running the family: GRIFFINS_UI, else TUI then app."""
+    ui = os.environ.get("GRIFFINS_UI")
+    if ui and ui not in BACKENDS:
+        raise Fail(f"GRIFFINS_UI must be app or tui, not {ui}")
+    for name in ([ui] if ui else ["tui", "app"]):
+        backend = BACKENDS[name]()
+        agents = probe(backend)
+        if agents:
+            return backend, agents
+    raise Fail(f"family {family()} isn't running" + (f" in the {ui}" if ui else "") + " (start it with: griffins)")
+
+
+# --- commands -------------------------------------------------------------------
+
+def say_state(name, info):
+    return f"{name:7} {info['id']:6} {info['state'] or 'unknown':8} {info['msg']}".rstrip()
+
+
+def status():
+    _, agents = find_family()
+    for name in AGENTS:
+        print(say_state(name, agents[name]) if name in agents else f"{name:7} not running")
+
+
+def agent_of(name, agents):
+    if name not in agents:
+        raise Fail(f"no live {name} in family {family()}")
+    return agents[name]
+
+
+def send(name, message):
+    """Type a message into a live <name> in this family."""
+    backend, agents = find_family()
+    info = agent_of(name, agents)
+    sender = os.environ.get("GRIFFINS_AGENT", "person")
+    backend.send(info, f"[from {sender}] {message}")
+    print(f"sent to {name} ({info['id']})")
+
+
+def clear(name):
+    """Type /clear into an idle or done agent; keys, since a pasted /clear is just text."""
+    backend, agents = find_family()
+    info = agent_of(name, agents)
+    # done = finished its turn (not yet looked at); working or blocked
+    # (waiting on the person) would lose what it's in the middle of.
+    if not is_idle(info["state"]):
+        raise Fail(f"{name} is {info['state'] or 'not reporting'}; only an idle or done agent can be cleared")
+    backend.type_command(info, "/clear")
+    print(f"cleared {name} ({info['id']})")
+
+
+def check_folders(folders):
+    out = []
+    for f in folders:
+        path = os.path.abspath(os.path.expanduser(f))
+        if not os.path.isdir(path):
+            raise Fail(f"no such folder: {path}")
+        out.append(path)
+    return out
+
+
+def move(folders):
+    folders = check_folders(folders)
+    backend, agents = find_family()
+    moved = False
+    for name in AGENTS:
+        info = agents.get(name)
+        if not info:
+            print(f"{name:7} not running, skipped")
+        elif not info["loop"] or read_folders(name) is None:
+            print(f"{name:7} was started without the restart loop, skipped")
+        elif read_folders(name) == folders:
+            print(f"{name:7} already there")
+        elif not is_idle(info["state"]):
+            print(f"{name:7} is {info['state'] or 'not reporting'}, skipped (run move again when it is idle)")
+        else:
+            write_folders(name, folders)
+            touch_restart(name)
+            backend.type_command(info, "/exit")
+            print(f"{name:7} moving to {folders[0]}")
+            moved = True
+    if moved:
+        backend.rename(agents, folders)
+        print("a folder Claude hasn't seen asks to trust it in each pane: answer yes there")
+
+
+def start(ui, folders):
+    folders = check_folders(folders or [home()])
+    for name in ["tui", "app"]:
+        backend = BACKENDS[name]()
+        agents = probe(backend)
+        if agents:
+            backend.focus(agents)
+            there = (read_folders("lois") or ["an unknown folder"])[0]
+            print(f"family {family()} is already running in {backend.where()}, in {there}; "
+                  f"to point it at another repo: griffins move <folder>")
+            return
+    for name in AGENTS:
+        write_folders(name, folders)
+        for stale in ("restart",):
+            if os.path.exists(state_path(name, stale)):
+                os.unlink(state_path(name, stale))
+    backend = BACKENDS[ui]()
+    backend.start(folders)
+    print(f"started family {family()} in {backend.where()}, in {folders[0]}")
+
+
+def usage():
+    return ("usage: griffins [--ui app|tui] [folder...] | griffins move <folder>... | "
+            "griffins send <name> <message> | griffins status | griffins clear <name> | griffins --help")
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return
+    if args and args[0] == "--agent":
+        resume = None
+        if len(args) >= 2 and args[-2] == "--resume":
+            resume, args = args[-1], args[:-2]
+        if len(args) not in (2, 3) or args[1] not in AGENTS or (len(args) == 3 and args[2] not in BACKENDS):
+            raise Fail("usage: griffins --agent <name> [app|tui] [--resume <session-id>]")
+        agent_loop(args[1], args[2] if len(args) == 3 else "app", resume)
+        return
+    if args and args[0] == "statusline":
+        if len(args) != 2 or args[1] not in AGENTS:
+            raise Fail("usage: griffins statusline <name>")
+        statusline(args[1])
+        return
+    if args == ["report-session"]:
+        report_session()
+        return
+    if args and args[0] == "send":
+        if len(args) < 3 or args[1] not in AGENTS:
+            raise Fail(f"usage: griffins send <{'|'.join(AGENTS)}> <message>")
+        send(args[1], " ".join(args[2:]))
+        return
+    if args == ["status"]:
+        status()
+        return
+    if args and args[0] == "clear":
+        if len(args) != 2 or args[1] not in AGENTS:
+            raise Fail(f"usage: griffins clear <{'|'.join(AGENTS)}>")
+        clear(args[1])
+        return
+    if args and args[0] == "move":
+        if len(args) < 2:
+            raise Fail("usage: griffins move <folder> [folder...]")
+        move(args[1:])
+        return
+    ui = "app" if os.environ.get("GRIFFINS_UI") == "app" else "tui"
+    if args[:1] == ["--ui"]:
+        if len(args) < 2 or args[1] not in BACKENDS:
+            raise Fail("usage: griffins --ui app|tui [folder...]")
+        ui, args = args[1], args[2:]
+    if any(a.startswith("-") for a in args):
+        raise Fail(usage())
+    start(ui, args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Fail as e:
+        sys.exit(f"griffins: {e}")
